@@ -1,306 +1,53 @@
-import { Webhook, firestore, getPrice, iamport, logger, send } from './tools';
-import dayjs, { Dayjs } from 'dayjs';
+import { auth, firestore, logger } from './tools';
 
-import mqtt from 'mqtt';
-
-const rideCol = firestore.collection('ride');
 const userCol = firestore.collection('users');
-const kickCol = firestore.collection('kick');
-const mqttClient = mqtt.connect(String(process.env.MQTT_URL), {
-  username: String(process.env.MQTT_USERNAME),
-  password: String(process.env.MQTT_PASSWORD),
-});
-
-const maxHours = Number(process.env.MAX_HOUR || 3);
-const sleep = (timeout: number) =>
-  new Promise((resolve) => setTimeout(resolve, timeout));
-const waitForConnect = () =>
-  new Promise<void>((resolve) => {
-    mqttClient.on('connect', () => {
-      mqttClient.subscribe('data/#');
-      logger.info(`서버와 연결되었습니다.`);
-      resolve();
-    });
-  });
-
-interface User {
-  uid: string;
-  username: string;
-  phone: string;
-  currentRide: string | null;
-  birthday: Dayjs;
-  billingKeys: string[];
-}
-
-interface Ride {
-  rideId: string;
-  userId: string;
-  branch: string;
-  cost: number;
-  coupon: string;
-  kickboardName: string;
-  kickboardId: string;
-  payment?: string;
-  startedAt: Dayjs;
-  endedAt: Dayjs;
-}
 
 async function main() {
-  try {
-    logger.info('시스템을 시작합니다.');
-    await waitForConnect();
-    mqttClient.on('error', (err) => {
-      throw err;
-    });
+  let count = 0;
+  const funcs = [];
+  const users = await getUsers();
+  const usersCount = users.length;
+  for (const user of users) {
+    funcs.push(async () => {
+      count++;
+      const userDoc = await user.data();
+      userDoc.name = userDoc.name || '고객';
+      try {
+        const authUser = await auth.getUser(user.id);
+        if (userDoc.phone === authUser.phoneNumber) {
+          logger.info(
+            `[${count}/${usersCount}] ${userDoc.name}님 이미 등록되어 있습니다. ${authUser.phoneNumber} (${user.id})`
+          );
 
-    while (true) {
-      logger.info('작업을 시작합니다.');
-      await runSchedule();
-      logger.info('5분 동안 대기합니다.');
-      await sleep(5 * 60 * 1000);
-    }
-  } catch (err) {
-    await Webhook.send(`❌ 오류가 발생하여 시스템을 재시작합니다.`);
-    logger.error(err.message);
-    logger.error(err.stack);
-  }
-}
+          return;
+        }
 
-async function runSchedule() {
-  const rides = await getRides();
-  let i = 0;
-  for (const ride of rides) {
-    logger.info(
-      '==========================================================================='
-    );
+        await userCol.doc(user.id).update({ phone: authUser.phoneNumber });
+        logger.info(
+          `[${count}/${usersCount}] ${userDoc.name}님 전화번호는 ${authUser.phoneNumber} (${user.id})`
+        );
+      } catch (err) {
+        logger.warn(
+          `[${count}/${usersCount}] ${userDoc.name}님은 탈퇴된 사용자입니다. (${user.id})`
+        );
 
-    const now = dayjs();
-    const user = await getUser(ride.userId);
-    const diff = now.diff(ride.startedAt, 'minutes');
-    const price = await getPrice(ride.branch, diff);
-    const startedAt = ride.startedAt.format('YYYY년 MM월 DD일 HH시 mm분');
-    const usedAt = `${startedAt} ~ (${diff}분, ${price.toLocaleString()}원)`;
-
-    if (!user || !user.phone) {
-      logger.warn(`사용자를 찾을 수 없습니다. ${JSON.stringify(user)}`);
-      logger.warn(usedAt);
-      continue;
-    }
-
-    const birthday = user.birthday.format('YYYY년 MM월 DD일');
-    logger.info(
-      `${i++} >> ${user.username}님 ${user.phone} ${birthday} - ${usedAt}`
-    );
-
-    if (user.currentRide !== ride.rideId) {
-      logger.info('중복 처리된 데이터입니다. 삭제 처리합니다.');
-      await deleteRide(ride, user);
-      continue;
-    }
-
-    await terminateRide(ride, user);
-  }
-}
-
-async function isLastRide(ride: Ride): Promise<boolean> {
-  const rides = await rideCol
-    .where('kickName', '==', ride.kickboardId)
-    .orderBy('start_time', 'desc')
-    .limit(1)
-    .get();
-
-  let rideId;
-  rides.forEach((res) => (rideId = res.id));
-  return rideId ? ride.rideId === rideId : false;
-}
-
-async function getUser(uid: string): Promise<User | undefined> {
-  const userDoc = await userCol.doc(uid).get();
-  const userData = userDoc.data();
-  if (!userData) return;
-
-  return {
-    uid: userDoc.id,
-    username: userData.name,
-    phone: userData.phone,
-    currentRide: userData.curr_ride ? userData.curr_ride.id : null,
-    birthday: dayjs(userData.birth._seconds * 1000),
-    billingKeys: userData.billkey,
-  };
-}
-
-async function terminateRide(ride: Ride, user: User): Promise<void> {
-  const failed = '결제에 실패했습니다. 앱에서 재결제가 필요합니다.';
-  const minutes = ride.endedAt.diff(ride.startedAt, 'minutes');
-  const price = await getPrice(ride.branch, minutes);
-  const payment = await tryPayment(user, ride, price);
-  const diff = ride.endedAt.diff(ride.startedAt, 'minutes');
-  const startedAt = ride.startedAt.format('YYYY년 MM월 DD일 HH시 mm분');
-  const endedAt = ride.endedAt.format('HH시 mm분');
-  const usedAt = `${startedAt} ~ ${endedAt}(${diff}분)`;
-  const userDoc = userCol.doc(user.uid);
-  const cardName = payment ? payment.cardName : failed;
-  const priceStr = `${price.toLocaleString()}원`;
-  const props = { user, ride, usedAt, maxHours, priceStr, cardName };
-  const isLast = await isLastRide(ride);
-  user.username = user.username || '고객';
-  if (isLast) await stopKickboard(ride);
-
-  await Promise.all([
-    userDoc.update({
-      curr_ride: null,
-      currcoupon: null,
-    }),
-    rideCol.doc(ride.rideId).update({
-      cost: payment ? price : 0,
-      payment: payment && payment.merchantUid,
-      end_time: ride.endedAt.toDate(),
-    }),
-    userDoc.collection('ride').add({
-      branch: ride.branch,
-      end_time: ride.endedAt.toDate(),
-      ref: `ride/${ride.rideId}`,
-      start_time: ride.startedAt.toDate(),
-      unpaied: !payment,
-    }),
-    send(
-      user.phone,
-      'TE_2511',
-      `킥보드(${ride.kickboardName})가 자동으로 이용 종료되었습니다.`,
-      props
-    ),
-    Webhook.send(
-      `✅ ${user.username}님이 3시간 이상 이용하여 자동으로 종료되었습니다. ${cardName} / ${usedAt} / ${user.phone} / ${ride.branch} / ${priceStr}`
-    ),
-  ]);
-}
-
-async function getKickboardCodeById(
-  kickboardId: string
-): Promise<string | null> {
-  const kickboard = await kickCol.doc(kickboardId).get();
-  const data = kickboard.data();
-  return data && data.code;
-}
-
-async function stopKickboard(ride: Ride): Promise<void> {
-  await kickCol.doc(ride.kickboardId).update({ can_ride: true });
-  mqttClient.publish(ride.kickboardId, JSON.stringify({ cmd: 'stop' }));
-}
-
-async function tryPayment(
-  user: User,
-  ride: Ride,
-  price: number
-): Promise<{ merchantUid: string; cardName: string } | null> {
-  if (!user.billingKeys) return null;
-  try {
-    const merchantUid = `${Date.now()}`;
-    for (const billingKey of user.billingKeys) {
-      const res = await iamport.subscribe.again({
-        customer_uid: billingKey,
-        merchant_uid: merchantUid,
-        amount: price,
-        name: ride.branch,
-        buyer_name: user.username,
-        buyer_tel: user.phone,
-      });
-
-      if (res.status === 'paid') {
-        logger.info(`결제에 성공하였습니다. ${billingKey}`);
-        return {
-          merchantUid,
-          cardName: `${res.card_number} (${res.card_name})`,
-        };
+        logger.warn(`- ${err.message}`);
       }
-
-      logger.info(`결제 실패, ${res.fail_reason}`);
-      await sleep(3000);
-    }
-  } catch (err) {
-    logger.error('결제 오류가 발생하였습니다. ' + err.name);
-    logger.error(err.stack);
-  }
-
-  return null;
-}
-
-async function getRideById(rideId: string): Promise<Ride | null> {
-  const ride = await rideCol.doc(rideId).get();
-  const data = ride.data();
-  if (!data) return null;
-
-  return {
-    rideId: ride.id,
-    userId: data.uid,
-    branch: data.branch,
-    cost: data.cost,
-    coupon: data.coupon,
-    kickboardName: data.kick,
-    kickboardId: data.kickName,
-    payment: data.payment,
-    startedAt: dayjs(data.start_time._seconds * 1000),
-    endedAt: data.end_time ? dayjs(data.end_time._seconds * 1000) : dayjs(),
-  };
-}
-
-async function deleteRide(ride: Ride, user: User): Promise<void> {
-  if (user.currentRide === ride.rideId) {
-    logger.info(`탑승 중인 라이드입니다. 강제로 종료합니다.`);
-    await userCol.doc(user.uid).update({ curr_ride: null, currcoupon: null });
-  }
-
-  const ref = `ride/${ride.rideId}`;
-  const userRides = await userCol
-    .doc(user.uid)
-    .collection('ride')
-    .where('ref', '==', ref)
-    .get();
-
-  let userRideId;
-  userRides.forEach((ride) => (userRideId = ride.id));
-  if (userRideId) {
-    logger.info(`이미 결제된 라이드입니다.`);
-    await userCol.doc(user.uid).collection('ride').doc(userRideId).delete();
-  }
-
-  await rideCol.doc(ride.rideId).delete();
-}
-
-async function getRides(): Promise<Ride[]> {
-  const rides: Ride[] = [];
-  const subtractDayjs = dayjs().subtract(3, 'hours');
-  const inuseRides =
-    process.env.NODE_ENV === 'prod'
-      ? await rideCol
-          .where('start_time', '<', subtractDayjs.toDate())
-          .where('end_time', '==', null)
-          .orderBy('start_time', 'asc')
-          .get()
-      : await rideCol
-          .where('uid', '==', 'Lf6lP5Pv1rTPViWUJwKvmMGPwHj2')
-          .where('end_time', '==', null)
-          .orderBy('start_time', 'asc')
-          .get();
-
-  logger.info(`반납 안한 라이드, ${inuseRides.size}개 발견하였습니다.`);
-  inuseRides.forEach((ride) => {
-    const data = ride.data();
-    rides.push({
-      rideId: ride.id,
-      userId: data.uid,
-      branch: data.branch,
-      cost: data.cost,
-      coupon: data.coupon,
-      startedAt: dayjs(data.start_time._seconds * 1000),
-      endedAt: data.end_time ? dayjs(data.end_time._seconds * 1000) : dayjs(),
-      kickboardName: data.kick,
-      kickboardId: data.kickName,
-      payment: data.payment,
     });
-  });
+  }
 
-  return rides;
+  while (funcs.length) {
+    await Promise.all(funcs.splice(0, 50).map((f) => f()));
+  }
+}
+
+async function getUsers(): Promise<
+  FirebaseFirestore.QueryDocumentSnapshot<FirebaseFirestore.DocumentData>[]
+> {
+  const results: FirebaseFirestore.QueryDocumentSnapshot<FirebaseFirestore.DocumentData>[] = [];
+  const users = await userCol.get();
+  users.forEach((user) => results.push(user));
+  return results;
 }
 
 main();

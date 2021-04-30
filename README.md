@@ -1,1 +1,1 @@
-# TypeScript Template
+# HIKICK Legacy Auth
