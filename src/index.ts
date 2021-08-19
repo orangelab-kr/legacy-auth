@@ -14,6 +14,21 @@ async function main() {
       userDoc.name = userDoc.name || '고객';
       try {
         const authUser = await auth.getUser(user.id);
+        if (
+          userDoc.name.length !== userDoc.name.trim().length &&
+          userDoc.name.trim().length !== 0
+        ) {
+          logger.warn(
+            `[${count}/${usersCount}] ${userDoc.name}(${
+              userDoc.name.length
+            }자)님에 띄어쓰기가 있습니다. ${userDoc.name.trim()}(${
+              userDoc.name.trim().length
+            }자)`
+          );
+
+          await userCol.doc(user.id).update({ name: userDoc.name.trim() });
+        }
+
         if (userDoc.phone === authUser.phoneNumber) {
           logger.info(
             `[${count}/${usersCount}] ${userDoc.name}님 이미 등록되어 있습니다. ${authUser.phoneNumber} (${user.id})`
@@ -37,7 +52,7 @@ async function main() {
   }
 
   while (funcs.length) {
-    await Promise.all(funcs.splice(0, 50).map((f) => f()));
+    await Promise.all(funcs.splice(0, 500).map((f) => f()));
   }
 }
 
